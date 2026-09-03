@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 SWING_LOOKBACK = 2  # configurable per spec
 
 def detect_swings(df, lookback=SWING_LOOKBACK):
@@ -224,6 +226,157 @@ def get_htf_bias(df, resample_rule="15min", ma_window=10):
     else:
         return "consolidating"
 
+def get_current_session(timestamp):
+    """
+    timestamp: pandas Timestamp (UTC-aware)
+    Returns "london", "ny", or "other" based on locked session windows (ET).
+    """
+    et_time = timestamp.astimezone(ZoneInfo("America/New_York"))
+    hour = et_time.hour
+    minute = et_time.minute
+    time_decimal = hour + minute / 60
+
+    if 3.0 <= time_decimal < 6.0:
+        return "london"
+    elif 9.5 <= time_decimal < 11.5:
+        return "ny"
+    else:
+        return "other"
+
+def select_tp_pool(entry, sl, pools, direction, min_r=1.5, max_r=5.0):
+    """
+    pools: list of liquidity level dicts (opposing direction), e.g. BSL levels for a long.
+    Returns {"tp_level": price, "r_multiple": float} for furthest qualifying pool,
+    or None if no pool falls within [min_r, max_r].
+    """
+    risk = abs(entry - sl)
+    if risk == 0:
+        return None
+
+    candidates = []
+    for pool in pools:
+        level = pool["price"]
+        reward = abs(level - entry)
+        r_multiple = reward / risk
+        if min_r <= r_multiple <= max_r:
+            candidates.append((level, r_multiple))
+
+    if not candidates:
+        return None
+
+    best = max(candidates, key=lambda c: c[1])
+    return {"tp_level": best[0], "r_multiple": best[1]}
+
+def select_tp_pool(entry, sl, pools, direction, min_r=1.5, max_r=5.0):
+    """
+    pools: list of liquidity level dicts (opposing direction), e.g. BSL levels for a long.
+    Returns {"tp_level": price, "r_multiple": float} for furthest qualifying pool,
+    or None if no pool falls within [min_r, max_r].
+    """
+    risk = abs(entry - sl)
+    if risk == 0:
+        return None
+
+    candidates = []
+    for pool in pools:
+        level = pool["price"]
+        reward = abs(level - entry)
+        r_multiple = reward / risk
+        if min_r <= r_multiple <= max_r:
+            candidates.append((level, r_multiple))
+
+    if not candidates:
+        return None
+
+    best = max(candidates, key=lambda c: c[1])
+    return {"tp_level": best[0], "r_multiple": best[1]}
+
+def detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, direction, htf_bias):
+    """
+    Checks candle i as a potential entry point for the SH+BMS+RTO setup.
+    Returns a Signal dict if all hard gates + confluence pass, else None.
+    """
+    # --- HARD GATE 1: HTF bias alignment ---
+    bias_aligned = (direction == "bullish" and htf_bias == "bullish") or \
+                   (direction == "bearish" and htf_bias == "bearish")
+    if not bias_aligned:
+        return None
+
+    # --- HARD GATE 2: Liquidity sweep occurred recently ---
+    sweep_type = "ssl" if direction == "bullish" else "bsl"
+    levels = ssl_levels if direction == "bullish" else bsl_levels
+
+    # look back a window for a recent sweep (not necessarily at candle i itself)
+    recent_sweep = None
+    sweep_index = None
+    for j in range(max(0, i - 30), i + 1):
+        sweep = detect_liquidity_sweep(df, j, levels, sweep_type)
+        if sweep:
+            recent_sweep = sweep
+            sweep_index = j
+
+    if recent_sweep is None:
+        return None
+
+    # --- HARD GATE 3: BMS confirmed after the sweep ---
+    first_breaks = find_first_bms_breaks(df, swings, direction, start=sweep_index, end=i + 1)
+    if not first_breaks:
+        return None
+    bms_index = first_breaks[-1]  # most recent break after the sweep
+
+    # --- Order Block (supporting condition 1) ---
+    ob = find_order_block(df, bms_index, direction, as_of_index=i)
+    ob_valid = ob is not None and not ob["mitigated"]
+
+    # --- OTE retracement (supporting condition 2) ---
+    ote_valid = False
+    if ob_valid:
+        ote_valid = detect_ote(df, i, ob["index"], bms_index, direction)
+
+    # --- Session timing (supporting condition 3) ---
+    session = get_current_session(df["timestamp"].iloc[i])
+    session_valid = session in ("london", "ny")
+
+    # --- Confluence: need >=2 of 3 supporting conditions ---
+    supporting_count = sum([ob_valid, ote_valid, session_valid])
+    if supporting_count < 2:
+        return None
+
+    # Entry requires price to actually be in the OTE zone right now
+    if not ote_valid:
+        return None  # per spec: no entry without retracement confirmation
+
+    entry = df["close"].iloc[i]
+
+    # --- SL: OB boundary ---
+    if direction == "bullish":
+        sl = ob["low"]
+    else:
+        sl = ob["high"]
+
+    # --- TP: furthest opposing pool within R-multiple band ---
+    opposing_pools = bsl_levels if direction == "bullish" else ssl_levels
+    tp_result = select_tp_pool(entry, sl, opposing_pools, direction)
+    if tp_result is None:
+        return None  # per locked spec: no qualifying TP pool = NO TRADE
+
+    return {
+        "setup": "SH_BMS_RTO",
+        "direction": direction.upper(),
+        "htf_bias": htf_bias.upper(),
+        "liquidity_type": sweep_type.upper(),
+        "liquidity_swept": True,
+        "bms": True,
+        "order_block": {"high": ob["high"], "low": ob["low"], "index": ob["index"]},
+        "ote_retracement": True,
+        "confluence_count": supporting_count,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp_result["tp_level"],
+        "r_multiple": tp_result["r_multiple"],
+        "timestamp": str(df["timestamp"].iloc[i]),
+    }
+
 
 # if __name__ == "__main__":
 #     from data_loader import load_bars
@@ -286,21 +439,42 @@ def get_htf_bias(df, resample_rule="15min", ma_window=10):
 
 #         print(f"BMS at {bms_i} -> OB at {ob['index']} -> OTE hit at {ote_hit}")
 
+# if __name__ == "__main__":
+#     from data_loader import load_bars
+
+#     df = load_bars("sample_data/SPY_1min_aug2026.csv")
+#     swings = detect_swings(df)
+#     ssl_levels = find_ssl_levels(swings)
+#     bias = get_htf_bias(df)
+    
+#     sweep_hits = []
+#     for i in range(50, 200):
+#         sweep = detect_liquidity_sweep(df, i, ssl_levels, "ssl")
+#         if sweep:
+#             sweep_hits.append((i, sweep["price"]))
+#     print(f"HTF bias (full dataset, as of last candle): {bias}")
+
+#     print(f"SSL sweeps in range 50-200: {len(sweep_hits)}")
+#     print(sweep_hits[:10])
+    
+
 if __name__ == "__main__":
     from data_loader import load_bars
 
     df = load_bars("sample_data/SPY_1min_aug2026.csv")
     swings = detect_swings(df)
     ssl_levels = find_ssl_levels(swings)
-    bias = get_htf_bias(df)
-    
-    sweep_hits = []
-    for i in range(50, 200):
-        sweep = detect_liquidity_sweep(df, i, ssl_levels, "ssl")
-        if sweep:
-            sweep_hits.append((i, sweep["price"]))
-    print(f"HTF bias (full dataset, as of last candle): {bias}")
+    bsl_levels = find_bsl_levels(swings)
+    htf_bias = get_htf_bias(df)
 
-    print(f"SSL sweeps in range 50-200: {len(sweep_hits)}")
-    print(sweep_hits[:10])
-    
+    print(f"HTF bias: {htf_bias}")
+
+    signals = []
+    for i in range(50, 500):  # wider range now that we're testing the full pipeline
+        signal = detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, "bullish", htf_bias)
+        if signal:
+            signals.append(signal)
+
+    print(f"\nFound {len(signals)} valid signals in range 50-500")
+    for s in signals:
+        print(s)
