@@ -244,11 +244,6 @@ def get_current_session(timestamp):
         return "other"
 
 def select_tp_pool(entry, sl, pools, direction, min_r=1.5, max_r=5.0):
-    """
-    pools: list of liquidity level dicts (opposing direction), e.g. BSL levels for a long.
-    Returns {"tp_level": price, "r_multiple": float} for furthest qualifying pool,
-    or None if no pool falls within [min_r, max_r].
-    """
     risk = abs(entry - sl)
     if risk == 0:
         return None
@@ -256,6 +251,13 @@ def select_tp_pool(entry, sl, pools, direction, min_r=1.5, max_r=5.0):
     candidates = []
     for pool in pools:
         level = pool["price"]
+
+        # Direction filter: TP must be on the correct side of entry
+        if direction == "bullish" and level <= entry:
+            continue
+        if direction == "bearish" and level >= entry:
+            continue
+
         reward = abs(level - entry)
         r_multiple = reward / risk
         if min_r <= r_multiple <= max_r:
@@ -267,29 +269,6 @@ def select_tp_pool(entry, sl, pools, direction, min_r=1.5, max_r=5.0):
     best = max(candidates, key=lambda c: c[1])
     return {"tp_level": best[0], "r_multiple": best[1]}
 
-def select_tp_pool(entry, sl, pools, direction, min_r=1.5, max_r=5.0):
-    """
-    pools: list of liquidity level dicts (opposing direction), e.g. BSL levels for a long.
-    Returns {"tp_level": price, "r_multiple": float} for furthest qualifying pool,
-    or None if no pool falls within [min_r, max_r].
-    """
-    risk = abs(entry - sl)
-    if risk == 0:
-        return None
-
-    candidates = []
-    for pool in pools:
-        level = pool["price"]
-        reward = abs(level - entry)
-        r_multiple = reward / risk
-        if min_r <= r_multiple <= max_r:
-            candidates.append((level, r_multiple))
-
-    if not candidates:
-        return None
-
-    best = max(candidates, key=lambda c: c[1])
-    return {"tp_level": best[0], "r_multiple": best[1]}
 
 def detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, direction, htf_bias):
     """
@@ -348,11 +327,16 @@ def detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, direction, htf_bias
 
     entry = df["close"].iloc[i]
 
-    # --- SL: OB boundary ---
+        # --- SL: OB boundary ---
     if direction == "bullish":
         sl = ob["low"]
     else:
         sl = ob["high"]
+
+    # Reject unrealistically tight stops (won't survive real spread/slippage)
+    MIN_SL_DISTANCE = 0.05  # 5 cents, configurable — tune based on the instrument's typical spread
+    if abs(entry - sl) < MIN_SL_DISTANCE:
+        return None
 
     # --- TP: furthest opposing pool within R-multiple band ---
     opposing_pools = bsl_levels if direction == "bullish" else ssl_levels
@@ -376,6 +360,62 @@ def detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, direction, htf_bias
         "r_multiple": tp_result["r_multiple"],
         "timestamp": str(df["timestamp"].iloc[i]),
     }
+
+def scan_signals(df, symbol, lookback_candles=300):
+    """
+    Scans the most recent `lookback_candles` for valid SH+BMS+RTO setups,
+    in both directions. Returns a list of Signal dicts, deduplicated
+    per (direction, order_block_index) pair.
+    """
+    swings = detect_swings(df)
+    ssl_levels = find_ssl_levels(swings)
+    bsl_levels = find_bsl_levels(swings)
+    htf_bias = get_htf_bias(df)
+
+    start = max(0, len(df) - lookback_candles)
+    end = len(df)
+
+    signals = []
+    seen = set()  # (direction, ob_index) pairs already emitted
+
+    for direction in ("bullish", "bearish"):
+        for i in range(start, end):
+            signal = detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, direction, htf_bias)
+            if signal is None:
+                continue
+
+            key = (direction, signal["order_block"]["index"])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            signal["symbol"] = symbol
+            signals.append(signal)
+
+    return signals
+
+def score_conviction(signal, max_r=5.0):
+    """
+    Returns {"score": 0-100, "reasoning": [...]}.
+    Weighting: confluence factors up to 60 points (20 each, max 3),
+    r_multiple quality up to 40 points (scaled against max_r).
+    """
+    reasoning = []
+
+    confluence_points = signal["confluence_count"] * 20
+    reasoning.append(f"Confluence: {signal['confluence_count']}/3 supporting factors -> +{confluence_points}")
+
+    r_multiple = signal["r_multiple"]
+    r_points = min(40, (r_multiple / max_r) * 40)
+    reasoning.append(f"R-multiple: {r_multiple:.2f} (cap {max_r}) -> +{r_points:.1f}")
+
+    score = min(100, confluence_points + r_points)
+
+    return {
+        "score": round(score, 1),
+        "reasoning": reasoning,
+    }
+
 
 
 # if __name__ == "__main__":
@@ -458,23 +498,44 @@ def detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, direction, htf_bias
 #     print(sweep_hits[:10])
     
 
+# if __name__ == "__main__":
+#     from data_loader import load_bars
+
+#     df = load_bars("sample_data/SPY_1min_aug2026.csv")
+#     swings = detect_swings(df)
+#     ssl_levels = find_ssl_levels(swings)
+#     bsl_levels = find_bsl_levels(swings)
+#     htf_bias = get_htf_bias(df)
+
+#     print(f"HTF bias: {htf_bias}")
+
+#     signals = []
+#     seen_obs = set()
+#     for i in range(50, 500):
+#         signal = detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, "bullish", htf_bias)
+#         if signal:
+#             ob_index = signal["order_block"]["index"]
+#             if ob_index in seen_obs:
+#                 continue
+#             seen_obs.add(ob_index)
+#             signals.append(signal)
+
+#     print(f"\nFound {len(signals)} valid signals in range 50-500")
+#     for s in signals:
+#         print(s)
+
 if __name__ == "__main__":
     from data_loader import load_bars
 
     df = load_bars("sample_data/SPY_1min_aug2026.csv")
-    swings = detect_swings(df)
-    ssl_levels = find_ssl_levels(swings)
-    bsl_levels = find_bsl_levels(swings)
-    htf_bias = get_htf_bias(df)
 
-    print(f"HTF bias: {htf_bias}")
+    signals = scan_signals(df, symbol="SPY", lookback_candles=500)
+    print(f"Found {len(signals)} total signals (both directions)\n")
 
-    signals = []
-    for i in range(50, 500):  # wider range now that we're testing the full pipeline
-        signal = detect_sh_bms_rto(df, i, swings, ssl_levels, bsl_levels, "bullish", htf_bias)
-        if signal:
-            signals.append(signal)
-
-    print(f"\nFound {len(signals)} valid signals in range 50-500")
     for s in signals:
-        print(s)
+        conviction = score_conviction(s)
+        print(f"{s['direction']} | {s['timestamp']} | entry={s['entry']} sl={s['sl']} tp={s['tp']} r={s['r_multiple']:.2f}")
+        print(f"  Conviction: {conviction['score']}/100")
+        for reason in conviction['reasoning']:
+            print(f"    - {reason}")
+        print()
