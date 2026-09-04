@@ -2,31 +2,39 @@ from fastmcp import FastMCP
 from datetime import datetime, timedelta
 import sys
 import os
+import traceback
+from dotenv import load_dotenv
 
+# Load environment variables from project root's .env file FIRST
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 # This MUST come before the `from rules import ...` line below,
 # since Python resolves imports top-to-bottom.
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "strategy_engine"))
-
+sys.path.append(os.path.join(PROJECT_ROOT, "strategy_engine"))
 sys.path.append(os.path.dirname(__file__))  # if risk_engine.py is in the same folder
 
-import pandas as pd
-import numpy as np
-from alpaca_client import client, data_client
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
-from rules import scan_signals as _scan_signals, score_conviction as _score_conviction
-from datetime import datetime, timedelta
-from alpaca_client import client, data_client
-from risk_engine import check_risk as _check_risk
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.trading.requests import LimitOrderRequest
-
+# Initialize MCP server FIRST before any imports that might fail
 mcp = FastMCP("liqwid-trading-agent")
 
-import numpy as np
+# Now try to import dependencies
+try:
+    import pandas as pd
+    import numpy as np
+    from alpaca_client import client, data_client
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
+    from rules import scan_signals as _scan_signals, score_conviction as _score_conviction
+    from risk_engine import check_risk as _check_risk
+    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+    from alpaca.trading.requests import LimitOrderRequest
+except Exception as e:
+    # Log the error and exit gracefully
+    print(f"ERROR: Failed to initialize server dependencies: {e}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
 
 def _sanitize(obj):
     """Recursively convert NumPy types to native Python types for JSON serialization."""

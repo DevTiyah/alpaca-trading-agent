@@ -1,10 +1,19 @@
 import asyncio
+import sys
 import json
 from fastmcp import Client
-from fastmcp.client.transports import PythonStdioTransport
 
 SERVER_PATH = "mcp_server/server.py"
-transport = PythonStdioTransport(script_path=SERVER_PATH)
+
+config = {
+    "mcpServers": {
+        "liqwid": {
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [SERVER_PATH],
+        }
+    }
+}
 
 
 async def call_tool(client, name, args=None):
@@ -79,7 +88,7 @@ LIQWID CLI - Commands:
 
 async def repl():
     print("Connecting to LIQWID MCP server...")
-    async with Client(SERVER_PATH) as client:
+    async with Client(config) as client:
         print("Connected. Type 'help' for commands.\n")
 
         while True:
